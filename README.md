@@ -1,13 +1,16 @@
-# NAV price — Google-discovered sources prototype
+# NAV price — resilient daily data test
 
-## Pages
-- Main page: fetches five Morningstar factsheets, extracts current benchmark wording, and shows a consolidated T=0 / T-1 daily-return table.
-- Benchmark Chart page: separate chart page, as requested.
-
-## Data source note
-The prototype retrieves FRED's public CSV for `SP500` without an API key. FRED attributes the series to S&P Dow Jones Indices. It is the S&P 500 price index, not the exact `S&P 500 Net Total Return` benchmark in the AIA US Equity Fund factsheet. The app labels it as a proxy and does not fill returns for the other four funds until exact matching series are found.
-
-Google Search is used to discover and cross-check public sources, but scraping search-result pages is not a reliable data interface. The app links to Google Search and the underlying FRED source rather than treating snippets as data.
+This version fixes the previous failure mode: a FRED timeout no longer prevents the factsheet table from appearing. It attempts daily S&P 500 price-index data from Yahoo Finance, then FRED, then Stooq, with short per-request timeouts. Factsheet extraction and daily-data retrieval are handled independently.
 
 ## Deploy
-Upload `app.py`, `requirements.txt`, the `pages/` folder and this README to a GitHub repository. Deploy `app.py` on Streamlit Community Cloud.
+Upload `app.py`, `requirements.txt`, `README.md`, and `pages/1_Benchmark_Chart.py` to the repository and redeploy Streamlit Community Cloud.
+
+## Important data limitation
+The S&P 500 series used here is a **price index proxy**, not the exact S&P 500 Net Total Return benchmark stated in the AIA US Equity Fund factsheet. It is only used to test retrieval and table flow. Other fund rows remain blank until an exact series and source are verified. Public endpoints can fail or change; the app reports failure rather than inventing data.
+
+## Sources attempted
+- Yahoo Finance chart endpoint for `^GSPC`
+- FRED public CSV for `SP500`
+- Stooq daily CSV for `^SPX`
+
+The app keeps factsheet results visible even if all daily sources time out. The chart is on a separate Streamlit page.
