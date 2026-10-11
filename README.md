@@ -1,25 +1,26 @@
-# NAV price — AIA Factsheet Finder & Extractor
+# NAV price — One-click Daily Benchmark Monitor
 
-This version is designed to discover AIA ILP fund pages from the official directory and, if needed, AIA sitemaps. It then finds official factsheet PDF links and extracts benchmark wording, document-date candidates and reported performance-table candidates.
+A Streamlit prototype for five AIA fund factsheets. It downloads the supplied Morningstar PDF links, extracts the factsheet date and candidate active benchmark wording, fetches daily historical data automatically for the two configured Yahoo Finance series, and combines everything into one table.
 
-## What's new
-- Tries AIA's fund-price directory first, then sitemap discovery if needed.
-- Does not present a short hard-coded list as the complete 41-fund catalogue.
-- Includes an optional bulk scan of every fund page discovered, with CSV export.
-- Shows a per-fund status when a PDF is not found or cannot be parsed.
-- Keeps manual PDF upload as a fallback.
+## Run locally
 
-## Deploy
-1. In your GitHub `nav-price` repository, replace `app.py`, `requirements.txt`, and `README.md` with these files.
-2. Commit the changes.
-3. In Streamlit Community Cloud, wait for the app to redeploy. If needed, use **Refresh AIA catalogue and pages** in the sidebar.
-4. Check the discovered fund count. The target is all 41 funds; if fewer are discovered, open **Directory discovery diagnostics** and share the displayed message so the discovery method can be adjusted.
-5. Try one fund first, then use **Scan discovered funds** to test the full catalogue. Download the CSV to review which funds succeeded.
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-## Important
-The app extracts candidate text from PDFs; it does not guarantee exact table alignment or that every figure is correct. Verify benchmark notes and returns against the original official factsheet. It never fills missing figures with estimates.
+## Deploy on Streamlit Community Cloud
 
-Official sources:
-- https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/aia-fund-price
-- https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/fund-performance
-- https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/aia-annual-funds-reports
+1. Create a GitHub repository.
+2. Upload `app.py`, `requirements.txt`, and this README.
+3. Create a Streamlit app pointing to `app.py`.
+4. Click **Fetch all factsheets and daily returns**.
+
+## Important limitations
+
+- Five Morningstar document URLs are currently configured in `app.py`.
+- Yahoo Finance `^SP500TR` is a Total Return series and is not assumed to match the factsheet's S&P 500 Net Total Return variant exactly.
+- Yahoo Finance `^990100-USD-STRD` is a candidate MSCI World series; currency and net/gross treatment must be verified against the latest factsheet.
+- Composite Shariah, SGD 1-month deposit-rate, and iBoxx SGD Overall total-return benchmarks do not have verified automatic daily sources configured yet. They are shown as unavailable rather than guessed.
+- `T=0` and `T−1` mean the two latest daily return observations returned by the source series, not today's and yesterday's calendar dates when markets are closed.
+- Yahoo Finance availability and usage terms may change. This is a research/learning prototype, not investment advice.
