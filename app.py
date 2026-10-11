@@ -1,136 +1,148 @@
 import re, time
 from io import StringIO
-from datetime import datetime, timezone
 import pandas as pd
 import requests
 import streamlit as st
 import fitz
 
-st.set_page_config(page_title='NAV price', page_icon='📈', layout='wide')
+st.set_page_config(page_title="NAV price", page_icon="📈", layout="wide")
 FACTSHEETS = [
- {'fund':'AIA US Equity Fund','url':'https://doc.morningstar.com/Document/56e50cc5aa606c0161d09d15cc7de5ad.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07'},
- {'fund':'AIA Sustainable Multi-Thematic Fund','url':'https://doc.morningstar.com/Document/14881aad057e7317a556204fc79e64a7.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07'},
- {'fund':'AIA Shariah Global Diversified Fund','url':'https://doc.morningstar.com/Document/88e47b70c3bb196bc7d20acc4dab51cc.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07'},
- {'fund':'AIA S$ Money Market Fund','url':'https://doc.morningstar.com/Document/276e48d297edd7cc1111ea906b64a100.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07'},
- {'fund':'AIA Regional Fixed Income Fund','url':'https://doc.morningstar.com/Document/6cf9c99b91ed64fc3af226442a4ee366.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07'},
+ {"fund":"AIA US Equity Fund","url":"https://doc.morningstar.com/Document/56e50cc5aa606c0161d09d15cc7de5ad.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07"},
+ {"fund":"AIA Sustainable Multi-Thematic Fund","url":"https://doc.morningstar.com/Document/14881aad057e7317a556204fc79e64a7.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07"},
+ {"fund":"AIA Shariah Global Diversified Fund","url":"https://doc.morningstar.com/Document/88e47b70c3bb196bc7d20acc4dab51cc.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07"},
+ {"fund":"AIA S$ Money Market Fund","url":"https://doc.morningstar.com/Document/276e48d297edd7cc1111ea906b64a100.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07"},
+ {"fund":"AIA Regional Fixed Income Fund","url":"https://doc.morningstar.com/Document/6cf9c99b91ed64fc3af226442a4ee366.msdoc/?key=fe676c95ebbe14133d9103ba59358bd91d52b060dfdbd81e81f60e7e14394d07"},
 ]
-HEADERS={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36'}
-YAHOO_URL='https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=1mo&interval=1d&events=history'
-FRED_URL='https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500'
-STOOQ_URL='https://stooq.com/q/d/l/?s=%5Espx&i=d'
+HEADERS={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36"}
+TIMEOUT=(5,12)
+
+def clean_benchmark_text(text):
+    text=re.sub(r'\s+',' ',text).strip()
+    # Remove footnote/disclaimer prose which sometimes follows benchmark name.
+    for pat in [r'\.\s*\*?there is an allocation\b', r'\s+\*\s*there is an allocation\b',
+                r'\s+management\s+(?:private\s+)?(?:limited|pte ltd)\b']:
+        m=re.search(pat,text,re.I)
+        if m: text=text[:m.start()].strip()
+    return text.strip(' ;,:*')
 
 def parse_benchmark(text):
-    for m in re.finditer(r'current\s+benchmark\s*:\s*',text,re.I):
+    # Find the most recent/current benchmark wording in PDF text.
+    matches=list(re.finditer(r'current\s+benchmark\s*:\s*',text,re.I))
+    for m in matches:
         tail=text[m.end():]
         cuts=[]
-        for pat in [r'\s*\(\s*w\.e\.f\.?',r'\s*\(\s*with effect',r'\s*\(\s*effective',r'\s*\(\d+\)',r'\s+previous benchmark\s*:',r'\s+there is an allocation']:
+        for pat in [r'\s*\(\s*w\.e\.f\.?',r'\s*\(\s*with effect',r'\s*\(\s*effective',
+                    r'\s*\(\s*\d+\s*\)',r'\s+previous benchmark\s*:',r'\s+\*\s*there is an allocation']:
             x=re.search(pat,tail,re.I)
             if x: cuts.append(x.start())
-        end=min(cuts) if cuts else min(len(tail),240)
-        val=re.sub(r'\s+',' ',tail[:end]).strip(' ;,:*')
+        end=min(cuts) if cuts else min(len(tail),300)
+        val=clean_benchmark_text(tail[:end])
         if val: return val
+    # Some factsheets use different punctuation/capitalisation or text ordering.
     return ''
+
+def split_components(benchmark):
+    """Return weighted components when explicit percentages exist; otherwise one component."""
+    b=clean_benchmark_text(benchmark)
+    if not b or b.lower() in ('current benchmark not detected','—','-'):
+        return []
+    # Capture forms such as '60% MSCI ... and 40% Dow Jones ...'.
+    matches=list(re.finditer(r'(\d+(?:\.\d+)?)\s*%\s*',b))
+    if len(matches)>=2:
+        out=[]
+        for i,m in enumerate(matches):
+            start=m.end()
+            end=matches[i+1].start() if i+1<len(matches) else len(b)
+            name=b[start:end].strip(' ,;:*')
+            name=re.sub(r'\s+\band\b\s*$','',name,flags=re.I).strip()
+            name=clean_benchmark_text(name)
+            if name:
+                out.append({'Weight (%)':float(m.group(1)),'Benchmark component':name})
+        if out and abs(sum(x['Weight (%)'] for x in out)-100)>0.1:
+            # Keep detected weights visible; do not silently normalise them.
+            pass
+        return out
+    return [{'Weight (%)':100.0,'Benchmark component':b}]
 
 def fetch_factsheet(item):
     try:
-        r=requests.get(item['url'],headers=HEADERS,timeout=(8,20)); r.raise_for_status()
-        if not r.content.startswith(b'%PDF'):
-            raise ValueError('URL response was not a PDF')
+        r=requests.get(item['url'],headers=HEADERS,timeout=TIMEOUT); r.raise_for_status()
+        if not r.content.startswith(b'%PDF'): raise ValueError('Response was not a PDF')
         doc=fitz.open(stream=r.content,filetype='pdf')
         text='\n'.join(p.get_text('text') for p in doc)
         dm=re.search(r'(?:as at|as of|factsheet as at|data as at)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})',text,re.I)
         if not dm: dm=re.search(r'\b(\d{1,2}\s+[A-Za-z]+\s+\d{4})\b',text)
-        return {'Fund':item['fund'],'Factsheet date':dm.group(1) if dm else 'Date not detected','Active benchmark':parse_benchmark(text) or 'Current benchmark not detected','Factsheet status':'OK','Factsheet URL':item['url']},text
+        bench=parse_benchmark(text)
+        return {'Fund':item['fund'],'Factsheet date':dm.group(1) if dm else 'Date not detected','Active benchmark':bench or 'Current benchmark not detected','Factsheet status':'OK','Factsheet URL':item['url']},text
     except Exception as e:
-        return {'Fund':item['fund'],'Factsheet date':'—','Active benchmark':'—','Factsheet status':f'Failed: {str(e)[:100]}','Factsheet URL':item['url']},''
+        return {'Fund':item['fund'],'Factsheet date':'—','Active benchmark':'Current benchmark not detected','Factsheet status':f'Failed: {type(e).__name__}: {str(e)[:90]}','Factsheet URL':item['url']},''
 
-def parse_yahoo():
-    r=requests.get(YAHOO_URL,headers=HEADERS,timeout=(5,12)); r.raise_for_status()
-    payload=r.json()['chart']
-    if payload.get('error'): raise ValueError(str(payload['error']))
-    result=payload['result'][0]
-    closes=result['indicators']['quote'][0]['close']
-    stamps=result['timestamp']
-    df=pd.DataFrame({'Date':pd.to_datetime(stamps,unit='s',utc=True).date,'Close':closes})
-    df['Close']=pd.to_numeric(df['Close'],errors='coerce')
-    return df.dropna().sort_values('Date').reset_index(drop=True),'Yahoo Finance (^GSPC price index)',YAHOO_URL
-
-def parse_fred():
-    r=requests.get(FRED_URL,headers=HEADERS,timeout=(5,12)); r.raise_for_status()
+def fetch_sp500_proxy():
+    # Public FRED CSV: S&P 500 price index only, not net total return.
+    url='https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500'
+    r=requests.get(url,headers=HEADERS,timeout=TIMEOUT); r.raise_for_status()
     df=pd.read_csv(StringIO(r.text))
     date_col='observation_date' if 'observation_date' in df.columns else 'DATE'
-    if date_col not in df.columns or 'SP500' not in df.columns: raise ValueError('Unexpected FRED CSV format')
+    if date_col not in df.columns or 'SP500' not in df.columns: raise ValueError('Unexpected FRED CSV schema')
     df['Date']=pd.to_datetime(df[date_col],errors='coerce').dt.date
     df['Close']=pd.to_numeric(df['SP500'],errors='coerce')
-    return df[['Date','Close']].dropna().sort_values('Date').reset_index(drop=True),'FRED SP500 price index',FRED_URL
+    df=df[['Date','Close']].dropna().sort_values('Date').reset_index(drop=True)
+    if len(df)<3: raise ValueError('Not enough daily observations')
+    df['Return (%)']=df['Close'].pct_change()*100
+    return df,'FRED — S&P 500 price index','https://fred.stlouisfed.org/series/SP500'
 
-def parse_stooq():
-    r=requests.get(STOOQ_URL,headers=HEADERS,timeout=(5,12)); r.raise_for_status()
-    df=pd.read_csv(StringIO(r.text))
-    if not {'Date','Close'}.issubset(df.columns): raise ValueError('Unexpected Stooq CSV format')
-    df['Date']=pd.to_datetime(df['Date'],errors='coerce').dt.date
-    df['Close']=pd.to_numeric(df['Close'],errors='coerce')
-    return df[['Date','Close']].dropna().sort_values('Date').reset_index(drop=True),'Stooq ^SPX price-index series',STOOQ_URL
-
-def fetch_daily_with_fallback():
-    errors=[]
-    for fn in (parse_yahoo,parse_fred,parse_stooq):
+def component_data(component):
+    """Only return series with a deliberate, disclosed mapping. Never guess a ticker."""
+    name=component.lower()
+    if 'standard poor' in name or 's&p 500' in name:
         try:
-            df,source,url=fn()
-            if len(df)<3: raise ValueError('Fewer than three valid daily observations')
-            df['Daily return (%)']=df['Close'].pct_change()*100
-            return df,source,url,errors
+            df,source,url=fetch_sp500_proxy()
+            latest,prev,prevprev=df.iloc[-1],df.iloc[-2],df.iloc[-3]
+            return {'Source':source,'Ticker / series':'FRED: SP500','T=0 date':str(latest['Date']),
+                    'T=0 return (%)':round(float(latest['Return (%)']),6),'T−1 date':str(prev['Date']),
+                    'T−1 return (%)':round(float(prev['Return (%)']),6),
+                    'Status':'PROXY ONLY — price return, not net total return','Source URL':url}
         except Exception as e:
-            errors.append(f'{fn.__name__}: {type(e).__name__}: {str(e)[:160]}')
-    raise RuntimeError('All daily sources failed. '+ ' | '.join(errors))
+            return {'Source':'FRED','Ticker / series':'SP500','T=0 date':'—','T=0 return (%)':None,'T−1 date':'—','T−1 return (%)':None,'Status':f'Fetch failed: {type(e).__name__}','Source URL':'https://fred.stlouisfed.org/series/SP500'}
+    return {'Source':'Not connected','Ticker / series':'—','T=0 date':'—','T=0 return (%)':None,'T−1 date':'—','T−1 return (%)':None,
+            'Status':'Exact component series not yet verified','Source URL':''}
 
 st.title('📈 NAV price')
-st.caption('AIA factsheet benchmark extraction and daily returns. Use the left navigation for the separate chart page.')
-st.info('This version tries Yahoo Finance first, then FRED, then Stooq. The configured S&P 500 series is a price-index proxy, not the exact S&P 500 Net Total Return benchmark in the AIA factsheet. The app keeps factsheet results even if daily data sources time out.')
-if st.button('Fetch factsheets and latest daily returns',type='primary'):
-    facts=[]; texts={}; bar=st.progress(0)
+st.caption('Benchmark components and daily returns. Composite benchmarks are split into separate component rows.')
+st.info('This version extracts explicit benchmark weights and lists every component separately. It only fills returns where a data series is deliberately mapped; unknown components remain blank rather than being assigned a guessed ticker.')
+if st.button('Fetch factsheets and component returns',type='primary'):
+    facts=[]; texts={}; components=[]; bar=st.progress(0)
     for i,item in enumerate(FACTSHEETS):
         row,txt=fetch_factsheet(item); facts.append(row); texts[item['fund']]=txt
-        bar.progress((i+1)/(len(FACTSHEETS)+1))
-    st.session_state['facts']=facts; st.session_state['texts']=texts
-    try:
-        daily,source,source_url,errors=fetch_daily_with_fallback()
-        latest=daily.iloc[-1]; prev=daily.iloc[-2]; prev2=daily.iloc[-3]
-        t0=(latest['Close']/prev['Close']-1)*100
-        t1=(prev['Close']/prev2['Close']-1)*100
-        rows=[]
-        for f in facts:
-            is_us=f['Fund']=='AIA US Equity Fund'
-            rows.append({'Fund':f['Fund'],'Factsheet date':f['Factsheet date'],'Active benchmark (factsheet)':f['Active benchmark'],
-              'Daily series':source if is_us else 'Not matched to exact benchmark','T=0 date':str(latest['Date']) if is_us else '—',
-              'T=0 return':f'{t0:+.4f}%' if is_us else '—','T−1 date':str(prev['Date']) if is_us else '—',
-              'T−1 return':f'{t1:+.4f}%' if is_us else '—',
-              'Data status':'Proxy only — price return, not net total return' if is_us else 'Exact daily series not yet connected',
-              'Source URL':source_url if is_us else '', 'Factsheet URL':f['Factsheet URL']})
-        st.session_state['daily']=daily; st.session_state['daily_source']=source; st.session_state['daily_url']=source_url
-        st.session_state['results']=pd.DataFrame(rows); st.session_state['source_errors']=errors
-    except Exception as e:
-        st.session_state.pop('results',None)
-        st.session_state['daily_error']=str(e)
-    bar.progress(1.0)
+        comps=split_components(row['Active benchmark'])
+        if not comps:
+            components.append({'Fund':item['fund'],'Factsheet date':row['Factsheet date'],'Active benchmark':row['Active benchmark'],
+                               'Weight (%)':None,'Benchmark component':'—','Source':'—','Ticker / series':'—','T=0 date':'—',
+                               'T=0 return (%)':None,'T−1 date':'—','T−1 return (%)':None,'Status':'Benchmark not extracted','Source URL':''})
+        else:
+            for comp in comps:
+                data=component_data(comp['Benchmark component'])
+                components.append({'Fund':item['fund'],'Factsheet date':row['Factsheet date'],'Active benchmark':row['Active benchmark'],
+                                   'Weight (%)':comp['Weight (%)'],'Benchmark component':comp['Benchmark component'],**data})
+        bar.progress((i+1)/len(FACTSHEETS))
+    st.session_state['facts']=facts
+    st.session_state['components']=pd.DataFrame(components)
+    st.session_state['texts']=texts
 
 if 'facts' in st.session_state:
-    st.subheader('Factsheet benchmark extraction')
+    st.subheader('Active benchmarks extracted from factsheets')
     st.dataframe(pd.DataFrame(st.session_state['facts']).drop(columns=['Factsheet URL']),use_container_width=True,hide_index=True)
-if 'results' in st.session_state:
-    st.subheader('Consolidated daily benchmark returns')
-    st.dataframe(st.session_state['results'].drop(columns=['Source URL','Factsheet URL']),use_container_width=True,hide_index=True)
-    st.download_button('Download consolidated results CSV',st.session_state['results'].to_csv(index=False).encode(),'nav_price_daily_returns.csv','text/csv')
-    st.markdown(f"[Open daily source]({st.session_state['daily_url']})")
-    if st.session_state.get('source_errors'):
-        with st.expander('Fallback source diagnostics'):
-            st.write('A previous source failed; a later source succeeded.')
-            for err in st.session_state['source_errors']: st.write('• '+err)
-if st.session_state.get('daily_error'):
-    st.warning('Factsheets were still processed, but no daily source responded successfully.')
-    st.code(st.session_state['daily_error'])
+if 'components' in st.session_state:
+    st.subheader('Daily returns by benchmark component')
+    st.caption('For a weighted benchmark, each component gets its own row and return columns. T=0/T−1 are the two latest available observations for that component, not necessarily the same dates across providers.')
+    df=st.session_state['components']
+    st.dataframe(df.drop(columns=['Source URL']),use_container_width=True,hide_index=True)
+    st.download_button('Download component-level returns CSV',df.to_csv(index=False).encode(),'nav_price_component_returns.csv','text/csv')
+    with st.expander('How composite benchmarks are handled'):
+        st.write('The app extracts explicit percentage weights (for example, 60% and 40%) and creates a separate row for each named component. It does not calculate a blended benchmark return unless the exact component series, dates, currency, return type and weighting methodology have been verified.')
 if 'texts' in st.session_state:
-    with st.expander('Inspect extracted factsheet text'):
+    with st.expander('Inspect source PDF text'):
         for fund,txt in st.session_state['texts'].items():
-            st.markdown(f'**{fund}**'); st.text_area(f'Source text — {fund}',txt[:10000] if txt else 'No text extracted.',height=140,key='text_'+re.sub(r'\W+','_',fund))
-st.caption('Returns are calculated from consecutive valid daily closes. The latest available trading date is used, not the current calendar date. Proxy returns must not be confused with exact benchmark returns.')
+            st.markdown(f'**{fund}**')
+            st.text_area(f'Source text — {fund}',txt[:10000] if txt else 'No text extracted.',height=140,key='text_'+re.sub(r'\W+','_',fund))
+st.caption('Daily returns are calculated from consecutive valid daily index observations. Source variants matter: price return, gross total return and net total return are not interchangeable.')

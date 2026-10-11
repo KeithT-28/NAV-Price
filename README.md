@@ -1,16 +1,15 @@
-# NAV price — resilient daily data test
+# NAV price — Benchmark component returns
 
-This version fixes the previous failure mode: a FRED timeout no longer prevents the factsheet table from appearing. It attempts daily S&P 500 price-index data from Yahoo Finance, then FRED, then Stooq, with short per-request timeouts. Factsheet extraction and daily-data retrieval are handled independently.
+## What this version does
+- Downloads the five supplied Morningstar factsheet PDFs.
+- Extracts the current benchmark wording.
+- Splits explicit weighted benchmarks (e.g. `60% Index A and 40% Index B`) into separate component rows with their weights.
+- Attempts daily return retrieval only for a deliberately configured series: the S&P 500 price index from FRED, clearly labelled as a proxy rather than the S&P 500 Net Total Return benchmark.
+- Leaves other component returns blank until an exact source/variant is verified.
+- Exports a component-level CSV.
 
 ## Deploy
-Upload `app.py`, `requirements.txt`, `README.md`, and `pages/1_Benchmark_Chart.py` to the repository and redeploy Streamlit Community Cloud.
+Upload `app.py`, `requirements.txt`, and this README to Streamlit Community Cloud. Set the main file to `app.py`.
 
-## Important data limitation
-The S&P 500 series used here is a **price index proxy**, not the exact S&P 500 Net Total Return benchmark stated in the AIA US Equity Fund factsheet. It is only used to test retrieval and table flow. Other fund rows remain blank until an exact series and source are verified. Public endpoints can fail or change; the app reports failure rather than inventing data.
-
-## Sources attempted
-- Yahoo Finance chart endpoint for `^GSPC`
-- FRED public CSV for `SP500`
-- Stooq daily CSV for `^SPX`
-
-The app keeps factsheet results visible even if all daily sources time out. The chart is on a separate Streamlit page.
+## Important
+This is not yet a complete data feed. It does not guess tickers for MSCI AC World Islamic, Dow Jones Sukuk, the SGD deposit rate, or Markit iBoxx SGD Overall TR. Exact series and licensing/access must be verified before connecting returns. Composite benchmark returns are not calculated merely by averaging component daily returns.
