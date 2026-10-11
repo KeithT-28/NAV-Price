@@ -5,12 +5,44 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 APP_TITLE = "NAV price"
 AIA_DIRECTORY = "https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/aia-fund-price"
 AIA_FUNDS = "https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information"
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"}
-TIMEOUT = 25
+TIMEOUT = (8, 18)  # connect timeout, response timeout
+
+# Fallback is deliberately labelled as a starter list. AIA's full live directory
+# should be verified against the official page when it becomes reachable.
+FALLBACK_FUNDS = [
+    "AIA Acorns of Asia Fund",
+    "AIA Diversified Fixed Income Fund",
+    "AIA Equity Income Fund",
+    "AIA Global Corporate Bond Fund",
+    "AIA Global Dynamic Income Fund",
+    "AIA Global Equity Fund",
+    "AIA Global Bond Fund",
+    "AIA Growth Fund",
+    "AIA Regional Fixed Income Fund",
+    "AIA US Equity Fund",
+    "AIA US High Yield Bond Fund",
+]
+
+@st.cache_resource
+def session():
+    s = requests.Session()
+    retry = Retry(total=2, connect=2, read=1, backoff_factor=0.7,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET"])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        "Accept-Language": "en-SG,en;q=0.9",
+    })
+    return s
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
 st.markdown("""
@@ -31,192 +63,134 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def get_page(url):
-    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.text
+def fetch_html(url):
+    response = session().get(url, timeout=TIMEOUT)
+    response.raise_for_status()
+    return response.text
 
-def clean(s):
-    return re.sub(r"\s+", " ", str(s or "")).strip()
-
-def full_url(href, base):
-    return urljoin(base, href)
+def clean(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def discover_funds():
-    html = get_page(AIA_DIRECTORY)
-    soup = BeautifulSoup(html, "html.parser")
-    result = {}
-    base_path = urlparse(AIA_DIRECTORY).path.rstrip("/")
-    for a in soup.select("a[href]"):
-        url = full_url(a.get("href", ""), AIA_DIRECTORY)
-        path = urlparse(url).path.rstrip("/")
-        if path.startswith(base_path + "/"):
-            slug = path[len(base_path)+1:]
-            if not slug or "/" in slug or any(k in slug.lower() for k in ["comparison", "quickrank", "screener"]):
-                continue
-            name = clean(a.get_text(" ", strip=True)) or slug.replace("-", " ").title()
-            result[url] = {"name": name, "url": url}
-    return sorted(result.values(), key=lambda x: x["name"].lower())
+    """Try AIA live directory; never make app startup depend on this request."""
+    try:
+        html = fetch_html(AIA_DIRECTORY)
+        soup = BeautifulSoup(html, "html.parser")
+        found = {}
+        base_path = urlparse(AIA_DIRECTORY).path.rstrip("/")
+        for a in soup.select("a[href]"):
+            url = urljoin(AIA_DIRECTORY, a.get("href", ""))
+            path = urlparse(url).path.rstrip("/")
+            if path.startswith(base_path + "/"):
+                slug = path[len(base_path) + 1:]
+                if not slug or "/" in slug or any(x in slug.lower() for x in ["comparison", "screener", "quickrank"]):
+                    continue
+                name = clean(a.get_text(" ", strip=True)) or slug.replace("-", " ").title()
+                found[url] = {"name": name, "url": url, "source": "Discovered from AIA directory"}
+        if found:
+            return sorted(found.values(), key=lambda x: x["name"].lower()), None
+        return fallback_funds(), "AIA responded, but fund links were not found in the returned HTML."
+    except Exception as exc:
+        return fallback_funds(), f"AIA's directory could not be reached: {exc}"
 
-def extract_tables(soup):
-    tables = []
+def fallback_funds():
+    return [{"name": name, "url": AIA_DIRECTORY, "source": "Fallback list — verify on official AIA directory"}
+            for name in FALLBACK_FUNDS]
+
+def extract_facts(soup):
+    facts = {}
     for table in soup.find_all("table"):
-        try:
-            rows = []
-            for tr in table.find_all("tr"):
-                cells = [clean(td.get_text(" ", strip=True)) for td in tr.find_all(["th", "td"])]
-                if cells:
-                    rows.append(cells)
-            if rows:
-                tables.append(rows)
-        except Exception:
-            pass
-    return tables
-
-def find_fact_pairs(soup):
-    pairs = {}
-    for table in extract_tables(soup):
-        for row in table:
-            if len(row) >= 2:
-                key = row[0].strip().rstrip(":")
-                value = " | ".join(row[1:]).strip()
-                if key and value and len(key) < 100:
-                    pairs[key] = value
+        for tr in table.find_all("tr"):
+            cells = [clean(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
+            if len(cells) >= 2 and cells[0] and " ".join(cells[1:]):
+                facts[cells[0].rstrip(":")] = " | ".join(cells[1:])
     lines = [clean(x) for x in soup.get_text("\n").splitlines() if clean(x)]
-    wanted = ["Investment objective", "Underlying investment", "Underlying Funds", "Benchmark",
-              "Manager of ILP fund", "Fund currency", "Valuation date as of", "Risk classification"]
-    for i, line in enumerate(lines):
-        if any(line.lower() == x.lower() for x in wanted) and i + 1 < len(lines):
-            pairs.setdefault(line, lines[i+1])
-    return pairs
+    labels = ["Investment objective", "Benchmark", "Underlying Funds", "Underlying fund",
+              "Fund currency", "Manager of ILP fund", "Valuation date as of"]
+    for i, line in enumerate(lines[:-1]):
+        if any(line.lower() == label.lower() for label in labels):
+            facts.setdefault(line, lines[i+1])
+    return facts
 
-def find_docs(soup, page_url):
-    docs = []
+def document_links(soup, page_url):
+    output, seen = [], set()
     for a in soup.select("a[href]"):
-        label = clean(a.get_text(" ", strip=True))
-        href = full_url(a.get("href", ""), page_url)
+        href = urljoin(page_url, a.get("href", ""))
+        label = clean(a.get_text(" ", strip=True)) or "Fund document"
         test = (label + " " + href).lower()
-        if ".pdf" in href.lower() or any(x in test for x in ["factsheet", "fund summary", "investment fund summary", "product summary"]):
-            if href.lower().endswith(".pdf") or "factsheet" in test or "fund summary" in test or "investment fund summary" in test:
-                docs.append({"label": label or "PDF / fund document", "url": href})
-    seen = set()
-    return [d for d in docs if not (d["url"] in seen or seen.add(d["url"]))]
-
-def underlying_names(pairs):
-    candidates = []
-    for key, value in pairs.items():
-        if "underlying" in key.lower():
-            # Some pages place a long list in a single cell.
-            for part in re.split(r"\s*[;•]\s*|\s*\n\s*| \| ", value):
-                part = clean(part)
-                if "AIA" in part and ("Fund" in part or "Bond" in part or "Income" in part or "Equity" in part):
-                    part = re.sub(r"^(?:[-–]\s*)+", "", part)
-                    if part not in candidates:
-                        candidates.append(part)
-    # Also scan all visible page text for known-style fund names after "Underlying Funds".
-    return candidates
+        if (href.lower().endswith(".pdf") or "factsheet" in test or "fund summary" in test) and href not in seen:
+            seen.add(href)
+            output.append({"Document": label, "URL": href})
+    return output
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_fund(url, fallback_name):
+def load_selected_fund(url, name):
     try:
-        soup = BeautifulSoup(get_page(url), "html.parser")
-        h1 = soup.find("h1")
-        name = clean(h1.get_text(" ", strip=True)) if h1 else fallback_name
-        pairs = find_fact_pairs(soup)
-        docs = find_docs(soup, url)
-        underlying = underlying_names(pairs)
-        return {"name": name, "url": url, "facts": pairs, "documents": docs,
-                "underlying": underlying, "error": None}
-    except Exception as e:
-        return {"name": fallback_name, "url": url, "facts": {}, "documents": [],
-                "underlying": [], "error": str(e)}
+        html = fetch_html(url)
+        soup = BeautifulSoup(html, "html.parser")
+        facts = extract_facts(soup)
+        docs = document_links(soup, url)
+        return {"facts": facts, "docs": docs, "error": None}
+    except Exception as exc:
+        return {"facts": {}, "docs": [], "error": str(exc)}
 
-st.sidebar.header("Data settings")
-if st.sidebar.button("Refresh AIA pages", use_container_width=True):
-    st.cache_data.clear()
-    st.rerun()
-st.sidebar.markdown(f"[AIA fund-price directory]({AIA_DIRECTORY})")
-st.sidebar.markdown(f"[AIA fund information]({AIA_FUNDS})")
-st.sidebar.caption("Page cache: up to 6 hours. Refresh to request fresh pages.")
+with st.sidebar:
+    st.header("Data settings")
+    if st.button("Refresh AIA pages", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+    st.markdown(f"[AIA fund-price directory]({AIA_DIRECTORY})")
+    st.markdown(f"[AIA fund information]({AIA_FUNDS})")
+    st.caption("Successful page results are cached for up to 6 hours.")
 
-st.info("This version focuses on what each AIA ILP fund says it invests in and links to the latest available factsheet/summary. The parent fund's factsheet may report only the parent fund's returns—not the separate performance of each underlying fund. Where a separate underlying-fund return is not disclosed, the app will not infer it.")
+funds, discovery_warning = discover_funds()
+st.info("This version prioritises the latest official factsheet's reported performance and underlying funds only. It does not substitute live market returns for factsheet returns.")
+if discovery_warning:
+    st.warning(
+        discovery_warning + "\n\nThe app has opened using a fallback fund list instead of stopping. "
+        "The fallback list is not guaranteed to be complete; verify availability and fund names on AIA's official directory."
+    )
 
-try:
-    funds = discover_funds()
-except Exception as e:
-    st.error(f"Could not read AIA's fund directory: {e}")
-    st.markdown(f"Open the official directory manually: {AIA_DIRECTORY}")
+st.subheader("Choose an AIA ILP fund")
+search = st.text_input("Search funds", placeholder="e.g. Global Dynamic Income")
+filtered = [f for f in funds if search.lower() in f["name"].lower()] if search else funds
+if not filtered:
+    st.warning("No matching fund. Clear the search or refresh AIA pages.")
     st.stop()
 
-if not funds:
-    st.warning("No fund links were detected in the directory HTML. AIA may have changed its page structure.")
-    st.stop()
+chosen = st.selectbox("Fund", filtered, format_func=lambda f: f["name"])
+st.caption(chosen["source"])
+if st.button("Load selected fund details", type="primary"):
+    st.session_state["fund_details"] = load_selected_fund(chosen["url"], chosen["name"])
+    st.session_state["selected_fund_name"] = chosen["name"]
 
-left, right = st.columns([1, 2])
-with left:
-    query = st.text_input("Search ILP funds", placeholder="e.g. Global Dynamic Income")
-    filtered = [f for f in funds if query.lower() in f["name"].lower()] if query else funds
-    chosen = st.selectbox("Choose an AIA ILP fund", filtered, format_func=lambda f: f["name"])
-    load = st.button("Load fund factsheet details", type="primary", use_container_width=True)
-with right:
-    st.metric("Fund pages discovered", len(funds))
-    st.caption("Availability can vary by the policy. Confirm against the product summary for the relevant plan.")
-
-if "selected_fund_data" not in st.session_state:
-    st.session_state["selected_fund_data"] = None
-if load:
-    with st.spinner("Reading the selected AIA fund page and document links…"):
-        st.session_state["selected_fund_data"] = load_fund(chosen["url"], chosen["name"])
-
-data = st.session_state.get("selected_fund_data")
+data = st.session_state.get("fund_details")
 if data:
     st.divider()
-    st.subheader(data["name"])
-    st.markdown(f"**AIA fund page:** [{data['url']}]({data['url']})")
+    st.subheader(st.session_state.get("selected_fund_name", chosen["name"]))
     if data["error"]:
-        st.error(data["error"])
-    facts = data["facts"]
-    if facts:
-        st.markdown("### What does the ILP fund track or invest in?")
-        objective = next((v for k,v in facts.items() if "objective" in k.lower()), None)
-        benchmark = next((v for k,v in facts.items() if "benchmark" in k.lower()), None)
-        if objective:
-            st.markdown("**Investment objective**")
-            st.write(objective)
-        st.write("**Benchmark**")
-        st.write(benchmark or "Not detected in the page. Check the latest factsheet.")
-        selected_facts = [{"Field": k, "Value": v} for k,v in facts.items()
-                          if any(w in k.lower() for w in ["underlying", "benchmark", "currency", "risk", "manager", "fee", "objective"])]
-        if selected_facts:
-            st.dataframe(pd.DataFrame(selected_facts), use_container_width=True, hide_index=True)
+        st.error(f"Could not retrieve this page: {data['error']}")
+    if chosen["url"] == AIA_DIRECTORY:
+        st.warning("This entry came from the fallback list. The app has not verified a dedicated page for this fund yet.")
+        st.markdown(f"Open the official AIA directory and select the fund: [AIA ILP fund prices]({AIA_DIRECTORY})")
+    if data["facts"]:
+        st.markdown("### Fund facts")
+        st.dataframe(pd.DataFrame([{"Field": k, "Value": v} for k,v in data["facts"].items()]),
+                     use_container_width=True, hide_index=True)
+    if data["docs"]:
+        st.markdown("### Official documents detected")
+        st.dataframe(pd.DataFrame(data["docs"]), use_container_width=True, hide_index=True,
+                     column_config={"URL": st.column_config.LinkColumn()})
     else:
-        st.warning("No structured facts were detected in the page HTML. Use the official documents below.")
-
-    st.markdown("### Underlying funds listed by AIA")
-    if data["underlying"]:
-        st.dataframe(pd.DataFrame({"Underlying fund": data["underlying"]}), use_container_width=True, hide_index=True)
-    else:
-        st.info("The underlying-fund list was not reliably extracted from the page HTML. Open the official factsheet/summary below; do not treat this as proof that no underlying funds exist.")
-
-    st.markdown("### Latest available factsheets / summaries")
-    if data["documents"]:
-        for doc in data["documents"]:
-            st.markdown(f"- [{doc['label']}]({doc['url']})")
-    else:
-        st.info("No document links were detected automatically. Open the official AIA fund page to access available documents.")
-
-    st.markdown("### Underlying-fund returns")
-    st.write("This table will only be populated when a current official factsheet explicitly reports performance for the underlying funds. The parent ILP factsheet often reports the parent fund's performance instead.")
-    st.dataframe(pd.DataFrame(columns=["Underlying fund", "Return period", "Reported return", "As-of date", "Official source"]), use_container_width=True, hide_index=True)
-    st.caption("Next implementation step: download and parse the linked PDFs, identify each underlying fund's own latest factsheet, and extract its stated performance table with the report date and source link.")
+        st.info("No factsheet links were detected automatically. Open the official AIA directory and choose the fund to locate its latest factsheet.")
 
 st.divider()
-with st.expander("How returns will be displayed"):
+with st.expander("How NAV price handles data"):
     st.markdown("""
-- **Factsheet return** means the performance figure printed in the latest official factsheet, with the period preserved exactly (for example, 1 year, YTD, 3 years annualised, or since inception).
-- Each row must include the factsheet/report date and the performance period end date where disclosed.
-- Do not compare unlike periods without a clear label.
-- If an underlying fund's own factsheet or return is unavailable, show **Not disclosed / not found** rather than estimate it.
-- This version does not use daily exchange data as a substitute for factsheet performance.
+- Factsheet return means the performance figure printed in the latest official factsheet.
+- Each return must retain its stated period and factsheet/report date.
+- The parent ILP fund's return is not the same as the return of an underlying fund.
+- If the underlying fund's own factsheet does not disclose a return, the app should show **Not disclosed / not found**.
+- The fallback list is a resilience measure, not a claim that the list contains every currently available AIA ILP fund.
 """)
