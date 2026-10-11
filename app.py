@@ -1,8 +1,9 @@
 import re
+import xml.etree.ElementTree as ET
 from io import BytesIO
 from urllib.parse import urljoin, urlparse
 
-import fitz  # PyMuPDF
+import fitz
 import pandas as pd
 import requests
 import streamlit as st
@@ -13,15 +14,13 @@ from urllib3.util.retry import Retry
 APP_TITLE = "NAV price"
 AIA_DIRECTORY = "https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/aia-fund-price"
 AIA_FUNDS_INFO = "https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information"
-TIMEOUT = (8, 20)
-
-FALLBACK_FUNDS = [
-    "AIA Acorns of Asia Fund", "AIA Asia Pacific Equity Fund", "AIA Balanced Fund",
-    "AIA Diversified Fixed Income Fund", "AIA Equity Income Fund", "AIA Global Bond Fund",
-    "AIA Global Corporate Bond Fund", "AIA Global Dynamic Income Fund", "AIA Global Equity Fund",
-    "AIA Global Technology Fund", "AIA Growth Fund", "AIA Regional Fixed Income Fund",
-    "AIA US Equity Fund", "AIA US High Yield Bond Fund",
+AIA_SITEMAPS = [
+    "https://www.aia.com.sg/sitemap.xml",
+    "https://www.aia.com.sg/en/sitemap.xml",
+    "https://www.aia.com.sg/content/dam/sg-wise/sitemap.xml",
 ]
+BASE_PATH = urlparse(AIA_DIRECTORY).path.rstrip("/")
+TIMEOUT = (8, 15)
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
 st.markdown("""
@@ -32,17 +31,15 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 st.markdown(f"""
-<div class="hero">
-<h1 style="margin:0">📈 {APP_TITLE}</h1>
+<div class="hero"><h1 style="margin:0">📈 {APP_TITLE}</h1>
 <p>AIA factsheet benchmark notes and reported performance</p>
-<p class="muted">Extracts the benchmark wording and performance figures from an official factsheet PDF. Reports the document date and source.</p>
-</div>
+<p class="muted">Finds official fund pages, locates factsheet PDFs, and extracts the document date, benchmark wording and reported returns.</p></div>
 """, unsafe_allow_html=True)
 
 @st.cache_resource
 def get_session():
     s = requests.Session()
-    retry = Retry(total=2, connect=2, read=1, backoff_factor=.6,
+    retry = Retry(total=2, connect=2, read=1, backoff_factor=.5,
                   status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
     adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
     s.mount("https://", adapter)
@@ -56,73 +53,108 @@ def get_html(url):
     r.raise_for_status()
     return r.text
 
-@st.cache_data(ttl=21600, show_spinner=False)
-def discover_funds():
-    try:
-        soup = BeautifulSoup(get_html(AIA_DIRECTORY), "html.parser")
-        found = {}
-        base_path = urlparse(AIA_DIRECTORY).path.rstrip("/")
-        for a in soup.select("a[href]"):
-            url = urljoin(AIA_DIRECTORY, a.get("href", ""))
-            path = urlparse(url).path.rstrip("/")
-            if path.startswith(base_path + "/"):
-                slug = path[len(base_path)+1:]
-                if not slug or "/" in slug or any(x in slug.lower() for x in ["comparison", "screener", "quickrank"]):
-                    continue
-                name = " ".join(a.get_text(" ", strip=True).split()) or slug.replace("-", " ").title()
-                found[url] = {"name": name, "url": url, "verified": True}
-        if found:
-            return sorted(found.values(), key=lambda x: x["name"].lower()), None
-        return fallback(), "AIA responded but no fund links were detected. Showing an unverified fallback list."
-    except Exception as e:
-        return fallback(), f"Live AIA directory unavailable ({e}). Showing an unverified fallback list."
-
-def fallback():
-    return [{"name": n, "url": AIA_DIRECTORY, "verified": False} for n in FALLBACK_FUNDS]
-
 def clean(s):
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
+def looks_like_fund_url(url):
+    path = urlparse(url).path.rstrip("/")
+    if not path.startswith(BASE_PATH + "/"):
+        return False
+    slug = path[len(BASE_PATH) + 1:]
+    if not slug or "/" in slug:
+        return False
+    bad = ("comparison", "screener", "quickrank", "interactive-chart", "fund-performance", "fund-annual-performance")
+    return not any(x in slug.lower() for x in bad)
+
+def parse_fund_links(html, base_url):
+    soup = BeautifulSoup(html, "html.parser")
+    found = {}
+    for a in soup.select("a[href]"):
+        url = urljoin(base_url, a.get("href", ""))
+        if looks_like_fund_url(url):
+            path = urlparse(url).path.rstrip("/")
+            slug = path.rsplit("/", 1)[-1]
+            name = clean(a.get_text(" ", strip=True)) or slug.replace("-", " ").title()
+            # Exclude generic navigation links with no plausible fund name.
+            if len(slug) > 2:
+                found[url] = {"name": name, "url": url, "catalogue_source": "AIA directory", "verified": True}
+    return found
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def discover_funds():
+    errors = []
+    found = {}
+    # First attempt: official directory.
+    try:
+        found.update(parse_fund_links(get_html(AIA_DIRECTORY), AIA_DIRECTORY))
+    except Exception as e:
+        errors.append(f"Directory: {type(e).__name__}: {e}")
+    # Second attempt: sitemap(s), useful when the interactive directory times out.
+    if len(found) < 35:
+        for sitemap_url in AIA_SITEMAPS:
+            try:
+                r = get_session().get(sitemap_url, timeout=TIMEOUT)
+                if not r.ok or not r.text.lstrip().startswith("<"):
+                    continue
+                root = ET.fromstring(r.content)
+                ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+                locs = [x.text for x in root.findall(".//sm:loc", ns) if x.text]
+                # Follow sitemap indexes, but cap requests to avoid slow startup.
+                if locs and all("sitemap" in x.lower() for x in locs[:5]):
+                    candidate_locs = []
+                    for child in locs[:20]:
+                        try:
+                            cr = get_session().get(child, timeout=TIMEOUT)
+                            if cr.ok:
+                                croot = ET.fromstring(cr.content)
+                                candidate_locs.extend(x.text for x in croot.findall(".//sm:loc", ns) if x.text)
+                        except Exception:
+                            continue
+                    locs = candidate_locs
+                for url in locs:
+                    if looks_like_fund_url(url):
+                        slug = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+                        found.setdefault(url, {"name": slug.replace("-", " ").title(), "url": url,
+                                               "catalogue_source": "AIA sitemap", "verified": True})
+                if len(found) >= 35:
+                    break
+            except Exception as e:
+                errors.append(f"Sitemap: {type(e).__name__}: {e}")
+    # A small seed list is intentionally not presented as the complete catalogue.
+    if found:
+        rows = sorted(found.values(), key=lambda x: x["name"].lower())
+        return rows, ("Some fund pages may be missing; AIA returned only " + str(len(rows)) + " matching fund links.") if len(rows) < 35 else None, errors
+    return [], "Could not retrieve the live directory or discover fund pages through AIA sitemaps. No unverified placeholder catalogue is shown.", errors
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def page_documents(url):
-    if url == AIA_DIRECTORY:
-        return []
     soup = BeautifulSoup(get_html(url), "html.parser")
-    docs = []
-    seen = set()
+    docs, seen = [], set()
     for a in soup.select("a[href]"):
         href = urljoin(url, a.get("href", ""))
         label = clean(a.get_text(" ", strip=True)) or "Fund document"
         low = (href + " " + label).lower()
-        if (href.lower().endswith(".pdf") or "factsheet" in low or "fund summary" in low) and href not in seen:
+        if (href.lower().split("?")[0].endswith(".pdf") or "factsheet" in low or "fund summary" in low) and href not in seen:
             seen.add(href)
-            docs.append({"label": label, "url": href})
+            kind = "Factsheet" if "factsheet" in low else ("Fund summary" if "summary" in low else "PDF document")
+            docs.append({"label": label, "kind": kind, "url": href})
     return docs
 
 def download_pdf(url):
-    response = get_session().get(url, timeout=TIMEOUT)
-    response.raise_for_status()
-    if "pdf" not in response.headers.get("content-type", "").lower() and not url.lower().endswith(".pdf"):
-        # Try parsing anyway, but reject obvious HTML.
-        if response.content[:5] != b"%PDF-":
-            raise ValueError("The link did not return a PDF file.")
-    if not response.content.startswith(b"%PDF-"):
-        raise ValueError("The selected URL does not appear to be a PDF.")
-    return response.content
+    r = get_session().get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    if not r.content.startswith(b"%PDF-"):
+        raise ValueError("The URL did not return a readable PDF file.")
+    return r.content
 
 def pdf_text(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    for i, page in enumerate(doc):
-        pages.append((i + 1, page.get_text("text", sort=True)))
-    return pages
+    return [(i + 1, page.get_text("text", sort=True)) for i, page in enumerate(doc)]
 
 def get_document_date(text):
-    patterns = [
-        r"(?:as of|as at|as on)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
-        r"(?:prepared on|prepared as at|factsheet\s*[:|]?\s*)(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
-        r"(?:as of|as at|as on)\s+(\d{1,2}/\d{1,2}/\d{4})",
-    ]
+    patterns = [r"(?:as of|as at|as on)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+                r"(?:prepared on|prepared as at)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})",
+                r"(?:as of|as at|as on)\s+(\d{1,2}/\d{1,2}/\d{4})"]
     for pattern in patterns:
         m = re.search(pattern, text, re.I)
         if m:
@@ -133,13 +165,12 @@ def get_document_date(text):
 def extract_benchmark_notes(text):
     lines = [clean(x) for x in text.splitlines() if clean(x)]
     out = []
-    terms = ("current benchmark", "benchmark:", "benchmark^", "previous benchmark", "combined benchmark")
+    terms = ("current benchmark", "benchmark:", "benchmark^", "previous benchmark", "benchmark is", "benchmark changed")
     for i, line in enumerate(lines):
         if any(term in line.lower() for term in terms):
-            # Keep the actual note and a few following lines to capture wrapped PDF text.
             chunk = [line]
-            for nxt in lines[i+1:i+4]:
-                if re.search(r"past performance|disclaimer|investments are subject|notes?\s*\(", nxt, re.I):
+            for nxt in lines[i + 1:i + 4]:
+                if re.search(r"past performance|disclaimer|investments are subject", nxt, re.I):
                     break
                 chunk.append(nxt)
             candidate = clean(" ".join(chunk))
@@ -148,146 +179,181 @@ def extract_benchmark_notes(text):
     return out
 
 def parse_performance_tables(text):
-    """Conservative parser: extracts text rows only when a row label and percentages are nearby."""
     lines = [clean(x) for x in text.splitlines() if clean(x)]
-    results = []
-    periods = ["1 Month", "3 Months", "6 Months", "YTD", "1 Year", "3 Year", "5 Year", "10 Year", "Since Inception"]
-    percent_re = re.compile(r"[-+]?\d{1,3}(?:\.\d{1,4})?\s*%")
-    labels = ["Fund (bid-to-bid)", "Fund (bid to bid)", "Fund", "Benchmark", "Relative Return", "Class I", "Class A", "Class"]
+    results, seen = [], set()
+    percent_re = re.compile(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d{1,4})?\s*%")
+    labels = ["Fund (bid-to-bid)", "Fund (bid to bid)", "Fund", "Benchmark", "Relative Return"]
     for i, line in enumerate(lines):
         if any(re.fullmatch(re.escape(label), line, re.I) for label in labels):
-            nearby = " ".join(lines[i+1:i+5])
+            nearby = " ".join(lines[i + 1:i + 6])
             vals = percent_re.findall(nearby)
             if vals:
-                results.append({"Row": line, "Extracted percentages": ", ".join(v.replace(" ", "") for v in vals),
-                                "Text around row": nearby[:500]})
-    # Capture rows where all values are on same line.
+                key = (line, tuple(vals))
+                if key not in seen:
+                    seen.add(key)
+                    results.append({"Row candidate": line, "Extracted percentages": ", ".join(v.replace(" ", "") for v in vals), "Nearby PDF text": nearby[:600]})
     for line in lines:
-        low = line.lower()
-        if any(label.lower() in low for label in ["fund (bid-to-bid)", "fund (bid to bid)", "benchmark", "relative return", "annualized returns", "cumulative returns"]):
+        if any(x in line.lower() for x in ["fund (bid-to-bid)", "fund (bid to bid)", "benchmark", "relative return"]):
             vals = percent_re.findall(line)
-            if vals:
-                item = {"Row": line[:100], "Extracted percentages": ", ".join(v.replace(" ", "") for v in vals),
-                        "Text around row": line[:500]}
-                if item not in results:
-                    results.append(item)
+            key = (line[:150], tuple(vals))
+            if vals and key not in seen:
+                seen.add(key)
+                results.append({"Row candidate": line[:150], "Extracted percentages": ", ".join(v.replace(" ", "") for v in vals), "Nearby PDF text": line[:600]})
     return results
 
 def parse_pdf(pdf_bytes):
     pages = pdf_text(pdf_bytes)
-    all_text = "\n".join(t for _, t in pages)
-    return {
-        "pages": pages,
-        "document_date": get_document_date(all_text),
-        "benchmarks": extract_benchmark_notes(all_text),
-        "performance": parse_performance_tables(all_text),
-        "all_text": all_text,
-    }
+    text = "\n".join(t for _, t in pages)
+    return {"pages": pages, "document_date": get_document_date(text), "benchmarks": extract_benchmark_notes(text),
+            "performance": parse_performance_tables(text), "all_text": text}
+
+def save_result(fund, doc, parsed):
+    return {"Fund": fund, "Document type": doc.get("kind", "Uploaded PDF"), "Document date": parsed["document_date"],
+            "Benchmark candidate": " | ".join(parsed["benchmarks"]) or "Not detected",
+            "Performance candidates": " | ".join(x["Row candidate"] + ": " + x["Extracted percentages"] for x in parsed["performance"]) or "Not detected",
+            "Source URL": doc.get("url", "")}
 
 with st.sidebar:
     st.header("Data settings")
-    if st.button("Refresh AIA pages", use_container_width=True):
+    if st.button("Refresh AIA catalogue and pages", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
     st.markdown(f"[AIA fund-price directory]({AIA_DIRECTORY})")
     st.markdown(f"[AIA fund information]({AIA_FUNDS_INFO})")
-    st.caption("Directory/document pages cached for up to 6 hours.")
+    st.caption("Catalogue and document pages cached for 6 hours.")
 
-st.write("This version extracts the highlighted benchmark note and the reported performance table from a factsheet PDF. It does not estimate missing values. Since PDF layouts differ, extracted figures should be checked against the source PDF.")
-
-funds, warning = discover_funds()
+st.info("This app extracts official factsheet wording and reported figures only. It does not estimate missing returns. Always verify extracted figures against the source PDF.")
+funds, warning, errors = discover_funds()
 if warning:
-    st.warning(warning + " The fallback catalogue may not be complete.")
-st.caption(f"{len(funds)} fund entries available in the selector. Verify that the selected fund is available under your policy.")
+    st.warning(warning)
+if errors:
+    with st.expander("Directory discovery diagnostics"):
+        for err in errors:
+            st.write("- " + err)
+st.caption(f"{len(funds)} fund pages discovered from AIA. This count reflects pages the app could identify, not a guarantee that every fund has a separate factsheet.")
 
-tab_auto, tab_upload, tab_method = st.tabs(["Find AIA factsheet", "Upload factsheet PDF", "Extraction notes"])
+if not funds:
+    st.markdown(f"[Open the official AIA fund-price directory]({AIA_DIRECTORY})")
+    st.write("You can still analyse an official factsheet using the upload tab below.")
 
+tab_auto, tab_bulk, tab_upload, tab_method = st.tabs(["Find a factsheet", "Scan discovered funds", "Upload factsheet PDF", "Extraction notes"])
 with tab_auto:
-    search = st.text_input("Search AIA funds", placeholder="e.g. Acorns of Asia")
-    filtered = [f for f in funds if search.lower() in f["name"].lower()] if search else funds
-    if filtered:
-        selected = st.selectbox("Choose fund", filtered, format_func=lambda f: f["name"])
-        if not selected["verified"]:
-            st.info("This is a fallback entry; the app has not verified a dedicated fund page because the live directory was unavailable.")
-            st.markdown(f"[Open AIA fund-price directory]({AIA_DIRECTORY})")
-        else:
-            if st.button("Find official factsheet links", type="primary"):
+    if funds:
+        search = st.text_input("Search AIA funds", placeholder="e.g. Acorns of Asia")
+        filtered = [f for f in funds if search.lower() in f["name"].lower()] if search else funds
+        if filtered:
+            selected = st.selectbox("Choose fund", filtered, format_func=lambda f: f["name"])
+            st.markdown(f"[Open official fund page]({selected['url']})")
+            if st.button("Find official factsheet PDFs", type="primary"):
                 try:
-                    with st.spinner("Checking this fund page for factsheet and summary PDF links…"):
+                    with st.spinner("Checking this fund page for official PDF links…"):
                         docs = page_documents(selected["url"])
                     st.session_state["doc_links"] = docs
                     st.session_state["doc_fund"] = selected["name"]
                 except Exception as e:
-                    st.error(f"Could not retrieve the selected fund page: {e}")
-        if st.session_state.get("doc_fund") == selected["name"]:
-            docs = st.session_state.get("doc_links", [])
-            if docs:
-                st.markdown("#### Documents found")
-                for i, d in enumerate(docs):
-                    st.markdown(f"- [{d['label']}]({d['url']})")
-                options = [d for d in docs if d["url"].lower().endswith(".pdf")]
-                if options:
-                    chosen_doc = st.selectbox("Choose PDF to analyse", options, format_func=lambda d: d["label"] + " — " + d["url"].split("/")[-1])
-                    if st.button("Extract benchmark and performance"):
-                        try:
-                            with st.spinner("Downloading and reading the PDF…"):
-                                parsed = parse_pdf(download_pdf(chosen_doc["url"]))
-                            st.session_state["parsed_factsheet"] = parsed
-                            st.session_state["parsed_source"] = chosen_doc["url"]
-                            st.session_state["parsed_fund"] = selected["name"]
-                        except Exception as e:
-                            st.error(f"Could not extract this PDF: {e}")
-            else:
-                st.info("No PDF links were detected on the page. Upload the latest factsheet in the next tab, or open the official AIA page to download it manually.")
+                    st.error(f"Could not retrieve the fund page: {type(e).__name__}: {e}")
+            if st.session_state.get("doc_fund") == selected["name"]:
+                docs = st.session_state.get("doc_links", [])
+                if docs:
+                    st.markdown("#### Official documents found")
+                    for d in docs:
+                        st.markdown(f"- **{d['kind']}** — [{d['label']}]({d['url']})")
+                    pdf_options = [d for d in docs if d["url"].lower().split("?")[0].endswith(".pdf")]
+                    if pdf_options:
+                        chosen = st.selectbox("Choose a PDF to analyse", pdf_options, format_func=lambda d: f"{d['kind']} — {d['url'].split('/')[-1]}")
+                        if st.button("Extract benchmark and reported performance"):
+                            try:
+                                with st.spinner("Downloading and reading PDF…"):
+                                    parsed = parse_pdf(download_pdf(chosen["url"]))
+                                st.session_state["parsed_factsheet"] = parsed
+                                st.session_state["parsed_source"] = chosen["url"]
+                                st.session_state["parsed_fund"] = selected["name"]
+                                st.session_state["parsed_kind"] = chosen["kind"]
+                            except Exception as e:
+                                st.error(f"Could not read the PDF: {type(e).__name__}: {e}")
+                else:
+                    st.warning("No PDF links were found on this page. Try the manual upload tab.")
+    if "parsed_factsheet" in st.session_state:
+        parsed = st.session_state["parsed_factsheet"]
+        st.divider()
+        st.subheader(f"Extraction result: {st.session_state.get('parsed_fund', 'Selected fund')}")
+        st.write("**Document date:**", parsed["document_date"])
+        st.write("**Source:**", st.session_state.get("parsed_source", ""))
+        st.markdown("#### Benchmark wording candidates")
+        if parsed["benchmarks"]:
+            for b in parsed["benchmarks"]:
+                st.write("- " + b)
+        else:
+            st.warning("No benchmark note was detected in the extracted PDF text.")
+        st.markdown("#### Performance table candidates")
+        if parsed["performance"]:
+            st.dataframe(pd.DataFrame(parsed["performance"]), use_container_width=True, hide_index=True)
+        else:
+            st.warning("No likely performance rows were detected. This PDF may need a fund-specific parser or OCR.")
+        with st.expander("Extracted PDF text (for checking)"):
+            st.text(parsed["all_text"][:20000])
+
+with tab_bulk:
+    st.write("This checks every fund page discovered in the catalogue, finds linked PDF documents and attempts to extract factsheet data. It can take several minutes and some fund pages may fail or have no separate factsheet.")
+    if funds and st.button("Scan all discovered funds", type="primary"):
+        rows, failures = [], []
+        progress = st.progress(0)
+        status = st.empty()
+        for idx, fund in enumerate(funds):
+            status.write(f"Checking {idx + 1}/{len(funds)}: {fund['name']}")
+            try:
+                docs = page_documents(fund["url"])
+                pdfs = [d for d in docs if d["url"].lower().split("?")[0].endswith(".pdf") and "factsheet" in (d["url"] + " " + d["label"]).lower()]
+                if not pdfs:
+                    rows.append({"Fund": fund["name"], "Status": "No factsheet PDF link detected", "Document date": "", "Benchmark": "", "Performance candidates": "", "Source URL": fund["url"]})
+                else:
+                    # Prefer the most recent-looking / explicitly labelled factsheet link.
+                    chosen = sorted(pdfs, key=lambda d: ("factsheet" in d["label"].lower(), d["url"].lower()), reverse=True)[0]
+                    parsed = parse_pdf(download_pdf(chosen["url"]))
+                    rows.append({"Fund": fund["name"], "Status": "PDF parsed; verify figures", "Document date": parsed["document_date"],
+                                 "Benchmark": " | ".join(parsed["benchmarks"]) or "Not detected",
+                                 "Performance candidates": " | ".join(x["Row candidate"] + ": " + x["Extracted percentages"] for x in parsed["performance"]) or "Not detected",
+                                 "Source URL": chosen["url"]})
+            except Exception as e:
+                rows.append({"Fund": fund["name"], "Status": f"Failed: {type(e).__name__}: {str(e)[:160]}", "Document date": "", "Benchmark": "", "Performance candidates": "", "Source URL": fund["url"]})
+            progress.progress((idx + 1) / len(funds))
+        st.session_state["bulk_rows"] = rows
+        status.write("Scan finished.")
+    if st.session_state.get("bulk_rows"):
+        result_df = pd.DataFrame(st.session_state["bulk_rows"])
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
+        st.download_button("Download scan results as CSV", result_df.to_csv(index=False).encode("utf-8-sig"), "aia_factsheet_scan.csv", "text/csv")
+        st.caption("‘PDF parsed’ means text extraction succeeded, not that every extracted value is guaranteed correct. Check the source PDF.")
 
 with tab_upload:
-    st.write("Use this if AIA's site blocks automatic access or if you already downloaded the latest factsheet. The PDF stays in this app session; the app extracts text locally.")
-    uploaded = st.file_uploader("Upload official AIA factsheet PDF", type=["pdf"])
+    st.write("If AIA blocks automatic access, download the official factsheet from AIA and upload it here.")
+    uploaded = st.file_uploader("Upload official factsheet PDF", type=["pdf"])
     source_url = st.text_input("Optional official PDF URL", placeholder="Paste the source URL so it can be recorded")
+    fund_name = st.text_input("Fund name", placeholder="e.g. AIA Acorns of Asia Fund")
     if uploaded is not None and st.button("Extract uploaded factsheet", type="primary"):
         try:
-            with st.spinner("Reading PDF text…"):
-                parsed = parse_pdf(uploaded.getvalue())
+            parsed = parse_pdf(uploaded.getvalue())
             st.session_state["parsed_factsheet"] = parsed
             st.session_state["parsed_source"] = source_url.strip() or uploaded.name
-            st.session_state["parsed_fund"] = uploaded.name
+            st.session_state["parsed_fund"] = fund_name.strip() or uploaded.name
+            st.session_state["parsed_kind"] = "Uploaded PDF"
+            st.success("PDF text extraction completed.")
         except Exception as e:
-            st.error(f"Could not read PDF: {e}")
+            st.error(f"Could not read PDF: {type(e).__name__}: {e}")
 
 with tab_method:
     st.markdown("""
-**Fields extracted**
-- Factsheet/reporting date (when detectable).
-- Current benchmark notes and benchmark-change history, including index names, weights and effective dates when present.
-- Performance rows such as Fund (bid-to-bid), Benchmark, Relative Return, and percentage values printed in the PDF.
+**What this version does**
+- Attempts the official fund-price directory first, then AIA sitemap discovery if the directory fails or returns too few fund pages.
+- Lists only fund pages it actually discovers; it does not pretend a short fallback list is complete.
+- Opens individual fund pages and searches for official factsheet PDF links.
+- Extracts document-date candidates, benchmark wording and performance-table candidates from PDF text.
+- Offers a bulk scan and CSV export for discovered fund pages.
+- Allows manual PDF upload when automatic retrieval fails.
 
-**Accuracy rules**
-- The extracted figures are not automatically assigned to period columns unless the PDF text structure makes that mapping unambiguous.
-- A PDF may have text embedded as an image; this extractor will then need OCR.
-- The benchmark note identifies what the fund is measured against. It does not necessarily list underlying investable funds.
-- If an AIA page or PDF is unavailable, no figures are fabricated.
+**Known limitations**
+- AIA may render parts of the directory dynamically or block automated requests; a sitemap may not contain every fund page.
+- PDF links can be image-only or dynamically loaded. Image-only PDFs need OCR, which is not included in this version.
+- Performance rows are candidates, not a fully validated table-to-column mapping. Check the original factsheet before relying on figures.
+- The latest factsheet is determined from the document link/page available at scan time; the app does not claim a PDF is current unless its reporting date is visible.
 """)
-
-parsed = st.session_state.get("parsed_factsheet")
-if parsed:
-    st.divider()
-    st.subheader("Factsheet extraction results")
-    st.write(f"**Fund / file:** {st.session_state.get('parsed_fund', 'Factsheet')}")
-    st.write(f"**Factsheet date detected:** {parsed['document_date']}")
-    st.write(f"**Source:** {st.session_state.get('parsed_source', 'Not supplied')}")
-    st.markdown("### Benchmark notes")
-    if parsed["benchmarks"]:
-        for note in parsed["benchmarks"]:
-            st.write("• " + note)
-    else:
-        st.info("No benchmark note was detected automatically. Check the extracted text below or the source PDF.")
-    st.markdown("### Performance rows detected")
-    if parsed["performance"]:
-        st.dataframe(pd.DataFrame(parsed["performance"]), use_container_width=True, hide_index=True)
-        st.caption("These are candidate text extractions. Verify the values and period headings against the PDF before relying on them.")
-        csv = pd.DataFrame(parsed["performance"]).to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Download extracted performance rows", csv, "nav_price_factsheet_extract.csv", "text/csv")
-    else:
-        st.info("No performance rows were confidently detected in the PDF text. It may require OCR or a fund-specific parser.")
-    with st.expander("Inspect extracted PDF text"):
-        st.text_area("PDF text", parsed["all_text"][:30000], height=450)

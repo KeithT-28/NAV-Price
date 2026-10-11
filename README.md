@@ -1,43 +1,25 @@
-# NAV price — AIA Singapore ILP Fund Monitor
+# NAV price — AIA Factsheet Finder & Extractor
 
-A Streamlit app for monitoring AIA Singapore ILP fund pages, published NAV/unit prices, previous available valuation-day returns, and publicly disclosed underlying investments.
+This version is designed to discover AIA ILP fund pages from the official directory and, if needed, AIA sitemaps. It then finds official factsheet PDF links and extracts benchmark wording, document-date candidates and reported performance-table candidates.
 
-## Features
+## What's new
+- Tries AIA's fund-price directory first, then sitemap discovery if needed.
+- Does not present a short hard-coded list as the complete 41-fund catalogue.
+- Includes an optional bulk scan of every fund page discovered, with CSV export.
+- Shows a per-fund status when a PDF is not found or cannot be parsed.
+- Keeps manual PDF upload as a fallback.
 
-- Discovers AIA ILP fund pages from the official fund-price directory, with a small fallback list if links are not present in the returned HTML.
-- Retrieves fund facts and links to official fund documents where the public HTML exposes them.
-- Calculates returns from the two most recent prices detected in a historical price table.
-- Exports the monitor to CSV.
-- Includes a CSV import tool for official price history if the AIA website's interactive price table is not available to a simple web request.
-- Does not invent missing prices or holdings.
+## Deploy
+1. In your GitHub `nav-price` repository, replace `app.py`, `requirements.txt`, and `README.md` with these files.
+2. Commit the changes.
+3. In Streamlit Community Cloud, wait for the app to redeploy. If needed, use **Refresh AIA catalogue and pages** in the sidebar.
+4. Check the discovered fund count. The target is all 41 funds; if fewer are discovered, open **Directory discovery diagnostics** and share the displayed message so the discovery method can be adjusted.
+5. Try one fund first, then use **Scan discovered funds** to test the full catalogue. Download the CSV to review which funds succeeded.
 
-## Deploy on GitHub + Streamlit Community Cloud
+## Important
+The app extracts candidate text from PDFs; it does not guarantee exact table alignment or that every figure is correct. Verify benchmark notes and returns against the original official factsheet. It never fills missing figures with estimates.
 
-1. Create a **private** GitHub repository named `nav-price` (or another name you prefer).
-2. Upload `app.py`, `requirements.txt`, and `README.md` to the repository root.
-3. Commit the files to the `main` branch.
-4. Open Streamlit Community Cloud and create a new app from that repository.
-5. Select `app.py` as the main file and deploy.
-6. Open the app on your computer or iPhone. The layout is responsive.
-
-## Important data limitations
-
-AIA's public pages use interactive components for some price charts and historical tables. These values may be loaded client-side and may not be present in the HTML returned to Streamlit. The app only calculates returns when it can read at least two published prices. If values are missing, it leaves them blank and offers CSV import rather than substituting estimated data.
-
-The app attempts to discover the full live fund directory, but if AIA changes its page structure or blocks requests, it may only show the fallback fund list. Check the discovered fund count against AIA's official directory.
-
-Underlying funds are not the same as security-level holdings. For a complete stock/bond look-through, use the linked official factsheets and reports where available.
-
-## Official sources
-
-- AIA ILP Fund Prices: https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/aia-fund-price
-- AIA Fund Information: https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information
-- AIA ILP Fund Tools: https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/aia-ilp-fund-tools
-- AIA Annual Funds Reports: https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/aia-annual-funds-reports
-
-## Run locally (optional)
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+Official sources:
+- https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/aia-fund-price
+- https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/fund-performance
+- https://www.aia.com.sg/en/our-products/save-and-invest/aia-funds-information/aia-annual-funds-reports
