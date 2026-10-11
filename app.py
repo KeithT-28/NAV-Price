@@ -26,20 +26,64 @@ def fetch_pdf(url):
     text = '\n'.join(p.get_text('text') for p in doc)
     return text, len(r.content), len(doc)
 
+def clean_pdf_text(text):
+    """Normalize whitespace while preserving enough punctuation for benchmark parsing."""
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def extract_current_benchmark(text):
+    """Extract the current benchmark clause, excluding effective-date/footnote metadata.
+
+    The source PDFs often place '(w.e.f. ...)' immediately after the benchmark name.
+    For composite benchmarks, retain the full component wording and weights.
+    """
+    normalized = clean_pdf_text(text)
+    patterns = [
+        r'Current\s+benchmark\s*:\s*(.+?)(?=\s*\(\s*w\.?\s*e\.?\s*f\.?\b|\s*\(\s*with\s+effect\b|\s*\(\s*effective\b|\s*\(\s*previous\s+benchmark\b|\s*\(\s*\d+\s*\)|\s*Disclaimer\b|$)',
+        r'Current\s+benchmark\s*:\s*(.+?)(?=\s+Previous\s+benchmark\s*:|\s+Past\s+performance\b|\s+The\s+benchmark\b|$)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, normalized, flags=re.I)
+        if m:
+            value = m.group(1).strip(' ;:,.')
+            # If a PDF layout joined a footnote sentence to the benchmark, trim common tails.
+            value = re.split(r'\s+(?:There\s+is\s+an\s+allocation|The\s+benchmark\s+is|Disclaimer\s*:)', value, maxsplit=1, flags=re.I)[0].strip(' ;:,.')
+            if value:
+                return value
+    # Fallback for layouts that split the label from the text or use lowercase.
+    m = re.search(r'Current\s+benchmark\s*:\s*(.{1,300})', normalized, flags=re.I)
+    if m:
+        value = re.split(r'\s*\(\s*(?:w\.?\s*e\.?\s*f\.?|with\s+effect|effective|previous\s+benchmark)', m.group(1), maxsplit=1, flags=re.I)[0]
+        return value.strip(' ;:,.')
+    return 'Current benchmark not detected'
+
+
+def extract_benchmark_components(benchmark):
+    """Identify named benchmark index/rate components without inventing tickers."""
+    if not benchmark or benchmark == 'Current benchmark not detected':
+        return []
+    # Capture weighted components such as '60% Index A and 40% Index B'.
+    weighted = re.findall(r'(\d+(?:\.\d+)?\s*%\s*[^,;]+?)(?=\s+(?:and|\&)\s+\d+(?:\.\d+)?\s*%|$)', benchmark, flags=re.I)
+    if weighted:
+        components = []
+        for item in weighted:
+            item = item.strip(' .;,*')
+            item = re.sub(r'^\s*(\d+(?:\.\d+)?)\s*%\s*', r'\1% ', item)
+            components.append(item)
+        # Ensure final weighted component is captured even where punctuation differs.
+        if len(components) == 1 and re.search(r'\b\d+(?:\.\d+)?\s*%.*\b\d+(?:\.\d+)?\s*%', benchmark):
+            parts = re.split(r'\s+(?:and|&)\s+', benchmark, flags=re.I)
+            components = [x.strip(' .;,*') for x in parts if re.search(r'\d+(?:\.\d+)?\s*%', x)]
+        return components
+    return [benchmark.strip(' .;,*')]
+
+
 def extract_info(text):
-    lines = [re.sub(r'\s+', ' ', x).strip() for x in text.splitlines() if x.strip()]
-    date_match = re.search(r'(?:As of|as at|As at|as of)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})', text)
-    # Prefer the explicit current benchmark line, then gather nearby benchmark context.
-    current = []
-    for i, line in enumerate(lines):
-        if re.search(r'current benchmark', line, re.I):
-            current.append(' '.join(lines[i:min(len(lines), i+3)])[:1200])
-    if not current:
-        for i, line in enumerate(lines):
-            if re.search(r'benchmark\s*:', line, re.I):
-                current.append(' '.join(lines[i:min(len(lines), i+3)])[:1200])
-    benchmark = ' | '.join(dict.fromkeys(current)) if current else 'Benchmark wording not confidently detected; inspect source text'
-    return date_match.group(1) if date_match else 'Not detected', benchmark
+    normalized = clean_pdf_text(text)
+    date_match = re.search(r'(?:As of|as at|As at|as of|Factsheet as at|as at)\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})', normalized, flags=re.I)
+    benchmark = extract_current_benchmark(text)
+    components = extract_benchmark_components(benchmark)
+    return (date_match.group(1) if date_match else 'Not detected'), benchmark, components
 
 @st.cache_data(ttl=900, show_spinner=False)
 def latest_two_returns(ticker):
@@ -66,13 +110,14 @@ if st.button('Fetch all factsheets and daily returns', type='primary', use_conta
     rows, source_texts = [], {}
     progress = st.progress(0)
     for i, f in enumerate(FUNDS):
-        row = {'Fund': f['fund'], 'Factsheet date': '—', 'Active benchmark (factsheet)': '—', 'Benchmark data source': f['source'], 'Ticker': f['ticker'] or 'Not configured', 'T=0 date': '—', 'T=0 return': None, 'T−1 date': '—', 'T−1 return': None, 'Data status': '', 'Benchmark match / caveat': f['match']}
+        row = {'Fund': f['fund'], 'Factsheet date': '—', 'Active benchmark (factsheet)': '—', 'Benchmark component(s) identified': '—', 'Benchmark data source': f['source'], 'Ticker': f['ticker'] or 'Not configured', 'T=0 date': '—', 'T=0 return': None, 'T−1 date': '—', 'T−1 return': None, 'Data status': '', 'Benchmark match / caveat': f['match']}
         try:
             text, size, pages = fetch_pdf(f['url'])
-            asof, benchmark = extract_info(text)
+            asof, benchmark, components = extract_info(text)
             row['Factsheet date'] = asof
             row['Active benchmark (factsheet)'] = benchmark
-            source_texts[f['fund']] = {'text': text, 'url': f['url'], 'date': asof, 'benchmark': benchmark, 'size_kb': round(size/1024,1), 'pages': pages}
+            row['Benchmark component(s) identified'] = ' | '.join(components) if components else 'Not detected'
+            source_texts[f['fund']] = {'text': text, 'url': f['url'], 'date': asof, 'benchmark': benchmark, 'components': components, 'size_kb': round(size/1024,1), 'pages': pages}
             if f['ticker']:
                 try:
                     ret = latest_two_returns(f['ticker'])
@@ -100,6 +145,7 @@ if 'combined_rows' in st.session_state:
         'T=0 return': st.column_config.NumberColumn(format='%.5f%%'),
         'T−1 return': st.column_config.NumberColumn(format='%.5f%%'),
         'Active benchmark (factsheet)': st.column_config.TextColumn(width='large'),
+        'Benchmark component(s) identified': st.column_config.TextColumn(width='large'),
         'Benchmark match / caveat': st.column_config.TextColumn(width='large'),
         'Data status': st.column_config.TextColumn(width='large'),
     })
@@ -108,11 +154,14 @@ if 'combined_rows' in st.session_state:
     with st.expander('Inspect source factsheet text'):
         for fund, item in st.session_state.get('source_texts', {}).items():
             st.markdown(f"**{fund}** · factsheet date: {item['date']} · [Open PDF]({item['url']}) · {item['size_kb']} KB · {item['pages']} pages")
+            st.write('Extracted current benchmark:', item['benchmark'])
+            st.write('Benchmark component(s) identified:', item.get('components', []))
             st.text_area(f'Extracted PDF text — {fund}', item['text'][:12000], height=180, key='source_'+re.sub(r'\W+','_',fund))
 
 st.divider()
 st.markdown('**Coverage notes**')
 st.markdown('''
+- Benchmark parsing extracts the text following `Current benchmark:` and stops before effective-date/previous-benchmark metadata; weighted composite components are listed separately for review.
 - **AIA US Equity Fund:** Yahoo Finance `^SP500TR` is labelled S&P 500 Total Return. The factsheet wording indicates a *Net Total Return* variant, so the downloaded series is shown only as an explicitly caveated approximation until an exact series is confirmed.
 - **AIA Sustainable Multi-Thematic Fund:** Yahoo Finance `^990100-USD-STRD` is a candidate MSCI World series. Confirm the factsheet's currency and net/gross variant before relying on it as exact.
 - **AIA Shariah Global Diversified Fund:** composite benchmark; the app does not calculate a weighted return until both components, weights and methodology are confirmed.
